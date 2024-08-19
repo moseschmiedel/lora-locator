@@ -97,7 +97,7 @@ static UTIL_TIMER_Object_t timerTimeout;
 #define RX_TIMEOUT_VALUE              3000
 #define TX_TIMEOUT_VALUE              3000
 
-#define TIMEOUT_PERIOD_MS			  3000
+#define TIMEOUT_PERIOD_MS			  400
 
 /*Size of the payload to be sent*/
 /* Size must be greater of equal the PING and PONG*/
@@ -270,6 +270,12 @@ void estimate_position(TrackResponse_t a, TrackResponse_t b, TrackResponse_t c);
 void SubghzApp_Init(void)
 {
   /* USER CODE BEGIN SubghzApp_Init_1 */
+	/* Set verbose-level for debug printing
+	 * VLEVEL_H = All error and debug messages.
+	 * VLEVEL_M = Data output (RSSI readings) and critical messages.
+	 * VLEVEL_L = Only critical messages.
+	 */
+	UTIL_ADV_TRACE_SetVerboseLevel(VLEVEL_M);
 
   APP_LOG(TS_OFF, VLEVEL_M, "\n\rLoRa Locator\n\r");
   /* Get SubGHY_Phy APP version*/
@@ -286,7 +292,7 @@ void SubghzApp_Init(void)
 
   /* Led Timers*/
   if (UTIL_TIMER_Create(&timerTimeout, TIMEOUT_PERIOD_MS, UTIL_TIMER_ONESHOT, OnTimeoutEvent, NULL) != UTIL_TIMER_OK) {
-	  APP_LOG(TS_ON, VLEVEL_L, "Could not create timeout timer.\n\r");
+	  APP_LOG(TS_ON, VLEVEL_H, "Could not create timeout timer.\n\r");
   }
 //  UTIL_TIMER_Create(&timerLed, LED_PERIOD_MS, UTIL_TIMER_ONESHOT, OnledEvent, NULL);
 //  UTIL_TIMER_Start(&timerLed);
@@ -352,7 +358,7 @@ void SubghzApp_Init(void)
   /*fills tx buffer*/
   memset(BufferTx, 0x0, MAX_APP_BUFFER_SIZE);
 
-  APP_LOG(TS_ON, VLEVEL_L, "rand=%d\n\r", random_delay);
+  APP_LOG(TS_ON, VLEVEL_H, "rand=%d\n\r", random_delay);
   /*starts reception*/
   Radio.Rx(RX_TIMEOUT_VALUE + random_delay);
 
@@ -369,7 +375,7 @@ void SubghzApp_Init(void)
 static void OnTxDone(void)
 {
   /* USER CODE BEGIN OnTxDone */
-  APP_LOG(TS_ON, VLEVEL_L, "OnTxDone\n\r");
+  APP_LOG(TS_ON, VLEVEL_H, "OnTxDone\n\r");
   /* Update the State of the FSM*/
   State = TX;
   /* State change point for `node_state` FSM */
@@ -382,14 +388,14 @@ static void OnTxDone(void)
 static void OnRxDone(uint8_t *payload, uint16_t size, int16_t rssi, int8_t LoraSnr_FskCfo)
 {
   /* USER CODE BEGIN OnRxDone */
-  APP_LOG(TS_ON, VLEVEL_L, "OnRxDone\n\r");
+  APP_LOG(TS_ON, VLEVEL_H, "OnRxDone\n\r");
 #if ((USE_MODEM_LORA == 1) && (USE_MODEM_FSK == 0))
-  APP_LOG(TS_ON, VLEVEL_L, "RssiValue=%d dBm, SnrValue=%ddB\n\r", rssi, LoraSnr_FskCfo);
+  APP_LOG(TS_ON, VLEVEL_H, "RssiValue=%d dBm, SnrValue=%ddB\n\r", rssi, LoraSnr_FskCfo);
   /* Record payload Signal to noise ratio in Lora*/
   SnrValue = LoraSnr_FskCfo;
 #endif /* USE_MODEM_LORA | USE_MODEM_FSK */
 #if ((USE_MODEM_LORA == 0) && (USE_MODEM_FSK == 1))
-  APP_LOG(TS_ON, VLEVEL_L, "RssiValue=%d dBm, Cfo=%dkHz\n\r", rssi, LoraSnr_FskCfo);
+  APP_LOG(TS_ON, VLEVEL_H, "RssiValue=%d dBm, Cfo=%dkHz\n\r", rssi, LoraSnr_FskCfo);
   SnrValue = 0; /*not applicable in GFSK*/
 #endif /* USE_MODEM_LORA | USE_MODEM_FSK */
   /* Update the State of the FSM*/
@@ -433,7 +439,7 @@ static void OnRxDone(uint8_t *payload, uint16_t size, int16_t rssi, int8_t LoraS
 			  last_beacon_c_trk_res = packet;
 		  } break;
 		  }
-		  APP_LOG(TS_ON, VLEVEL_L, "Received packet from %u with RSSI=%d.\n\r", packet.device, packet.recv_rssi);
+		  APP_LOG(TS_ON, VLEVEL_M, "Received packet from %u with RSSI=%d.\n\r", packet.device, packet.recv_rssi);
 	  } else {
 		  ErrorHandler("Received packet which was too short.\n\r");
 	  }
@@ -560,19 +566,19 @@ void Tracking_Process(void)
 #if IS_BEACON_DEVICE == 1
 		switch(node_state) {
 		case NODE_STATE_INIT: {
-			APP_LOG(TS_ON, VLEVEL_L, "INIT_PHASE\n\r");
+			APP_LOG(TS_ON, VLEVEL_H, "INIT_PHASE\n\r");
 			// Beacon has nothing to do in INIT phase
 			SetState(NODE_STATE_TRACK_REQ_PHASE);
 			QueueTrackingTask();
 		}break;
 		case NODE_STATE_TRACK_REQ_PHASE: {
 			// Beacon is ready for receiving TrackRequests
-			APP_LOG(TS_ON, VLEVEL_L, "REQ_PHASE\n\r");
+			APP_LOG(TS_ON, VLEVEL_H, "REQ_PHASE\n\r");
 			next_state = NODE_STATE_TRACK_RES_PHASE;
 			Radio.Rx(RX_TIMEOUT_VALUE);
 		}break;
 		case NODE_STATE_TRACK_RES_PHASE: {
-			APP_LOG(TS_ON, VLEVEL_L, "RES_PHASE\n\r");
+			APP_LOG(TS_ON, VLEVEL_H, "RES_PHASE\n\r");
 			// Beacon answers TrackRequest with a TrackResponse
 			TrackResponse_t packet;
 			switch (BEACON_ID) {
@@ -596,7 +602,7 @@ void Tracking_Process(void)
 			Radio.Send(BufferTx, PAYLOAD_LEN);
 		}break;
 		case NODE_STATE_WAIT: {
-			APP_LOG(TS_ON, VLEVEL_L, "WAIT_PHASE\n\r");
+			APP_LOG(TS_ON, VLEVEL_H, "WAIT_PHASE\n\r");
 			SetState(NODE_STATE_INIT);
 			QueueTrackingTask();
 		}break;
@@ -605,13 +611,13 @@ void Tracking_Process(void)
 		switch(node_state) {
 		case NODE_STATE_INIT: {
 			// nothing to do -> switch to next state;
-			APP_LOG(TS_ON, VLEVEL_L, "INIT_PHASE\n\r");
+			APP_LOG(TS_ON, VLEVEL_H, "INIT_PHASE\n\r");
 			SetState(NODE_STATE_TRACK_REQ_PHASE);
 			QueueTrackingTask();
 		}break;
 		case NODE_STATE_TRACK_REQ_PHASE: {
 			// Tag sends TrackRequest in REQ_PHASE
-			APP_LOG(TS_ON, VLEVEL_L, "REQ_PHASE\n\r");
+			APP_LOG(TS_ON, VLEVEL_H, "REQ_PHASE\n\r");
 			TrackRequest_t track_request;
 			track_request.device = TAG;
 			track_request.id = track_request_id;
@@ -619,15 +625,16 @@ void Tracking_Process(void)
 
 			encode_track_request(BufferTx, track_request);
 
-			APP_LOG(TS_ON, VLEVEL_L, "Radio.Send()\n\r");
+			APP_LOG(TS_ON, VLEVEL_H, "Radio.Send()\n\r");
 
 			next_state = NODE_STATE_TRACK_RES_PHASE;
 
+			UTIL_TIMER_Start(&timerTimeout);
 			Radio.Send(BufferTx, PAYLOAD_LEN);
 		}break;
 		case NODE_STATE_TRACK_RES_PHASE: {
 			// Tag receives TrackResponses from all three beacons
-			//APP_LOG(TS_ON, VLEVEL_L, "RES_PHASE\n\r");
+			//APP_LOG(TS_ON, VLEVEL_H, "RES_PHASE\n\r");
 			if (last_beacon_a_trk_res.id >= 1 && last_beacon_a_trk_res.id == last_beacon_b_trk_res.id && last_beacon_a_trk_res.id == last_beacon_c_trk_res.id) {
 				estimate_position(last_beacon_a_trk_res, last_beacon_b_trk_res, last_beacon_c_trk_res);
 				SetState(NODE_STATE_WAIT);
@@ -637,7 +644,7 @@ void Tracking_Process(void)
 			}
 		}break;
 		case NODE_STATE_WAIT: {
-			APP_LOG(TS_ON, VLEVEL_L, "WAIT_PHASE\n\r");
+			APP_LOG(TS_ON, VLEVEL_H, "WAIT_PHASE\n\r");
 			SetState(NODE_STATE_INIT);
 			QueueTrackingTask();
 		}break;
@@ -654,12 +661,12 @@ void Tracking_Process(void)
 
 static void OnTimeoutEvent(void *context)
 {
-	APP_LOG(TS_ON, VLEVEL_L, "TIMEOUT\n\r");
-	SetState(NODE_STATE_INIT);
+	ErrorHandler("TX Timeout\n\r");
+	QueueTrackingTask();
 }
 
 static void ErrorHandler(char* errorMsg) {
-	APP_LOG(TS_ON, VLEVEL_L, "ERROR: %s", errorMsg);
+	APP_LOG(TS_ON, VLEVEL_H, "ERROR: %s", errorMsg);
 	SetState(NODE_STATE_INIT);
 }
 
