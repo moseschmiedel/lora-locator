@@ -25,6 +25,7 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "sys_app.h"
+#include "subghz_phy_app.h"
 
 /* USER CODE END Includes */
 
@@ -91,7 +92,6 @@ int main(void)
   MX_SubGHz_Phy_Init();
   MX_TIM2_Init();
   /* USER CODE BEGIN 2 */
-  HAL_TIM_Base_Start_IT(&htim2);
 
   /* USER CODE END 2 */
 
@@ -99,6 +99,7 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
+	//Tracking_Process();
     /* USER CODE END WHILE */
     MX_SubGHz_Phy_Process();
 

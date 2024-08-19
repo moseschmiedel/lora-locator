@@ -91,6 +91,7 @@ extern "C" {
 void SubghzApp_Init(void);
 
 /* USER CODE BEGIN EFP */
+void Tracking_Process(void);
 
 /* USER CODE END EFP */
 

@@ -83,7 +83,10 @@ typedef enum {
 	NODE_STATE_WAIT,
 } NodeState_t;
 
-NodeState_t node_state = NODE_STATE_INIT;
+static NodeState_t node_state = NODE_STATE_INIT;
+static NodeState_t next_state = NODE_STATE_INIT;
+
+static UTIL_TIMER_Object_t timerTimeout;
 
 /* USER CODE END PTD */
 
@@ -93,6 +96,8 @@ NodeState_t node_state = NODE_STATE_INIT;
 /*Timeout*/
 #define RX_TIMEOUT_VALUE              3000
 #define TX_TIMEOUT_VALUE              3000
+
+#define TIMEOUT_PERIOD_MS			  3000
 
 /*Size of the payload to be sent*/
 /* Size must be greater of equal the PING and PONG*/
@@ -149,6 +154,29 @@ int16_t last_rssi = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
+
+/**
+ * @brief Updates the `node_state` global with the new state value configured in `next_state`.
+ */
+static void UpdateState();
+
+/**
+ * @brief Sets the `node_state` global to `new_state`.
+ * @param new_state New `NodeState_t` value for `node_state`.
+ */
+static void SetState(NodeState_t new_state);
+
+/**
+ * @brief Add `TrackingProcess` to UTIL_SEQ task-queue. (Queue `TrackingProcess` for execution.)
+ */
+static void QueueTrackingTask();
+
+/**
+ * @brief Function to call when an error occurs
+ * @param errorMsg Short string which explains the error.
+ */
+static void ErrorHandler(char* errorMsg);
+
 /*!
  * @brief Function to be executed on Radio Tx Done event
  */
@@ -186,9 +214,15 @@ static void OnRxError(void);
 static void OnledEvent(void *context);
 
 /**
+ * @brief   Function executed when timeout timer elapses
+ * @param context ptr of Timeout context
+ */
+static void OnTimeoutEvent(void *context);
+
+/**
   * @brief Tracking state machine implementation
   */
-static void Tracking_Process(void);
+//static void Tracking_Process(void);
 
 /**
  * @brief Create byte buffer with data from `TrackRequest_t`.
@@ -251,6 +285,9 @@ void SubghzApp_Init(void)
           (uint8_t)(SUBGHZ_PHY_VERSION_SUB2));
 
   /* Led Timers*/
+  if (UTIL_TIMER_Create(&timerTimeout, TIMEOUT_PERIOD_MS, UTIL_TIMER_ONESHOT, OnTimeoutEvent, NULL) != UTIL_TIMER_OK) {
+	  APP_LOG(TS_ON, VLEVEL_L, "Could not create timeout timer.\n\r");
+  }
 //  UTIL_TIMER_Create(&timerLed, LED_PERIOD_MS, UTIL_TIMER_ONESHOT, OnledEvent, NULL);
 //  UTIL_TIMER_Start(&timerLed);
   /* USER CODE END SubghzApp_Init_1 */
@@ -319,8 +356,6 @@ void SubghzApp_Init(void)
   /*starts reception*/
   Radio.Rx(RX_TIMEOUT_VALUE + random_delay);
 
-  HAL_TIM_Base_Init(&htim2);
-  HAL_TIM_Base_Start(&htim2);
   /*register task to to be run in while(1) after Radio IT*/
   UTIL_SEQ_RegTask((1 << CFG_SEQ_Task_SubGHz_Phy_App_Process), UTIL_SEQ_RFU, Tracking_Process);
   /* USER CODE END SubghzApp_Init_2 */
@@ -337,8 +372,10 @@ static void OnTxDone(void)
   APP_LOG(TS_ON, VLEVEL_L, "OnTxDone\n\r");
   /* Update the State of the FSM*/
   State = TX;
+  /* State change point for `node_state` FSM */
+  UpdateState();
   /* Run PingPong process in background*/
-  UTIL_SEQ_SetTask((1 << CFG_SEQ_Task_SubGHz_Phy_App_Process), CFG_SEQ_Prio_0);
+  QueueTrackingTask();
   /* USER CODE END OnTxDone */
 }
 
@@ -372,12 +409,12 @@ static void OnRxDone(uint8_t *payload, uint16_t size, int16_t rssi, int8_t LoraS
 		  TrackRequest_t packet;
 		  decode_track_request(&packet, payload);
 		  last_id = packet.id;
-		  node_state = NODE_STATE_TRACK_RES_PHASE;
+		  last_rssi = rssi;
 	  } else {
-		  APP_LOG(TS_ON, VLEVEL_L, "Error: Received packet which was too short.\n\r");
+		  ErrorHandler("Received packet which was too short.\n\r");
 	  }
   } else {
-	  APP_LOG(TS_ON, VLEVEL_L, "Error: Received packet in wrong `node_state`.\n\r");
+	  ErrorHandler("Received packet in wrong `node_state`.\n\r");
   }
 #elif IS_TAG_DEVICE == 1
   if (node_state == NODE_STATE_TRACK_RES_PHASE) {
@@ -398,10 +435,10 @@ static void OnRxDone(uint8_t *payload, uint16_t size, int16_t rssi, int8_t LoraS
 		  }
 		  APP_LOG(TS_ON, VLEVEL_L, "Received packet from %u with RSSI=%d.\n\r", packet.device, packet.recv_rssi);
 	  } else {
-		  APP_LOG(TS_ON, VLEVEL_L, "Error: Received packet which was too short.\n\r");
+		  ErrorHandler("Received packet which was too short.\n\r");
 	  }
   } else {
-	  APP_LOG(TS_ON, VLEVEL_L, "Error: Received packet in wrong `node_state`.\n\r");
+	  ErrorHandler("Received packet in wrong `node_state`.\n\r");
   }
 #endif
 
@@ -409,42 +446,44 @@ static void OnRxDone(uint8_t *payload, uint16_t size, int16_t rssi, int8_t LoraS
   RssiValue = rssi;
   /* Record payload content*/
 
+  /* State change point for `node_state` FSM */
+  UpdateState();
 
   /* Run PingPong process in background*/
-  UTIL_SEQ_SetTask((1 << CFG_SEQ_Task_SubGHz_Phy_App_Process), CFG_SEQ_Prio_0);
+  QueueTrackingTask();
   /* USER CODE END OnRxDone */
 }
 
 static void OnTxTimeout(void)
 {
   /* USER CODE BEGIN OnTxTimeout */
-  APP_LOG(TS_ON, VLEVEL_L, "OnTxTimeout\n\r");
   /* Update the State of the FSM*/
   State = TX_TIMEOUT;
+  ErrorHandler("TX Timeout\n\r");
   /* Run PingPong process in background*/
-  UTIL_SEQ_SetTask((1 << CFG_SEQ_Task_SubGHz_Phy_App_Process), CFG_SEQ_Prio_0);
+  QueueTrackingTask();
   /* USER CODE END OnTxTimeout */
 }
 
 static void OnRxTimeout(void)
 {
   /* USER CODE BEGIN OnRxTimeout */
-  APP_LOG(TS_ON, VLEVEL_L, "OnRxTimeout\n\r");
   /* Update the State of the FSM*/
   State = RX_TIMEOUT;
+  ErrorHandler("RX Timeout\n\r");
   /* Run PingPong process in background*/
-  UTIL_SEQ_SetTask((1 << CFG_SEQ_Task_SubGHz_Phy_App_Process), CFG_SEQ_Prio_0);
+  QueueTrackingTask();
   /* USER CODE END OnRxTimeout */
 }
 
 static void OnRxError(void)
 {
   /* USER CODE BEGIN OnRxError */
-  APP_LOG(TS_ON, VLEVEL_L, "OnRxError\n\r");
   /* Update the State of the FSM*/
   State = RX_ERROR;
+  ErrorHandler("Error while receiving LoRa-packet.\n\r");
   /* Run PingPong process in background*/
-  UTIL_SEQ_SetTask((1 << CFG_SEQ_Task_SubGHz_Phy_App_Process), CFG_SEQ_Prio_0);
+  QueueTrackingTask();
   /* USER CODE END OnRxError */
 }
 
@@ -503,7 +542,7 @@ void decode_track_response(TrackResponse_t *packet, uint8_t *buffer) {
 #define PLE 32.0
 
 float calculate_distance(int16_t rssi) {
-	return pow(10, (a.rssi + RSSI0) / PLE);
+	return pow(10, (rssi + RSSI0) / PLE);
 }
 
 void estimate_position(TrackResponse_t a, TrackResponse_t b, TrackResponse_t c) {
@@ -513,23 +552,27 @@ void estimate_position(TrackResponse_t a, TrackResponse_t b, TrackResponse_t c) 
 	return;
 }
 
-uint8_t track_request_id = 0;
+static uint8_t track_request_id = 1;
 
-static void Tracking_Process(void)
+void Tracking_Process(void)
 {
-//  Radio.Sleep();
 
 #if IS_BEACON_DEVICE == 1
 		switch(node_state) {
 		case NODE_STATE_INIT: {
+			APP_LOG(TS_ON, VLEVEL_L, "INIT_PHASE\n\r");
 			// Beacon has nothing to do in INIT phase
-			node_state = NODE_STATE_TRACK_REQ_PHASE;
+			SetState(NODE_STATE_TRACK_REQ_PHASE);
+			QueueTrackingTask();
 		}break;
 		case NODE_STATE_TRACK_REQ_PHASE: {
 			// Beacon is ready for receiving TrackRequests
+			APP_LOG(TS_ON, VLEVEL_L, "REQ_PHASE\n\r");
+			next_state = NODE_STATE_TRACK_RES_PHASE;
 			Radio.Rx(RX_TIMEOUT_VALUE);
 		}break;
 		case NODE_STATE_TRACK_RES_PHASE: {
+			APP_LOG(TS_ON, VLEVEL_L, "RES_PHASE\n\r");
 			// Beacon answers TrackRequest with a TrackResponse
 			TrackResponse_t packet;
 			switch (BEACON_ID) {
@@ -548,22 +591,27 @@ static void Tracking_Process(void)
 
 			encode_track_response(BufferTx, packet);
 
-			Radio.Send(BufferTx, TRACK_RESPONSE_SIZE);
+			next_state = NODE_STATE_WAIT;
 
-			node_state = NODE_STATE_WAIT;
+			Radio.Send(BufferTx, PAYLOAD_LEN);
 		}break;
 		case NODE_STATE_WAIT: {
-			node_state = NODE_STATE_INIT;
+			APP_LOG(TS_ON, VLEVEL_L, "WAIT_PHASE\n\r");
+			SetState(NODE_STATE_INIT);
+			QueueTrackingTask();
 		}break;
 		}
 #elif IS_TAG_DEVICE == 1
 		switch(node_state) {
 		case NODE_STATE_INIT: {
 			// nothing to do -> switch to next state;
-			node_state = NODE_STATE_TRACK_REQ_PHASE;
+			APP_LOG(TS_ON, VLEVEL_L, "INIT_PHASE\n\r");
+			SetState(NODE_STATE_TRACK_REQ_PHASE);
+			QueueTrackingTask();
 		}break;
 		case NODE_STATE_TRACK_REQ_PHASE: {
 			// Tag sends TrackRequest in REQ_PHASE
+			APP_LOG(TS_ON, VLEVEL_L, "REQ_PHASE\n\r");
 			TrackRequest_t track_request;
 			track_request.device = TAG;
 			track_request.id = track_request_id;
@@ -571,31 +619,61 @@ static void Tracking_Process(void)
 
 			encode_track_request(BufferTx, track_request);
 
-			Radio.Send(BufferTx, TRACK_REQUEST_SIZE);
+			APP_LOG(TS_ON, VLEVEL_L, "Radio.Send()\n\r");
 
-			node_state = NODE_STATE_TRACK_RES_PHASE;
+			next_state = NODE_STATE_TRACK_RES_PHASE;
+
+			Radio.Send(BufferTx, PAYLOAD_LEN);
 		}break;
 		case NODE_STATE_TRACK_RES_PHASE: {
 			// Tag receives TrackResponses from all three beacons
-			if (last_beacon_a_trk_res.id == last_beacon_b_trk_res.id && last_beacon_a_trk_res.id == last_beacon_c_trk_res.id) {
+			//APP_LOG(TS_ON, VLEVEL_L, "RES_PHASE\n\r");
+			if (last_beacon_a_trk_res.id >= 1 && last_beacon_a_trk_res.id == last_beacon_b_trk_res.id && last_beacon_a_trk_res.id == last_beacon_c_trk_res.id) {
 				estimate_position(last_beacon_a_trk_res, last_beacon_b_trk_res, last_beacon_c_trk_res);
-				node_state = NODE_STATE_WAIT;
+				SetState(NODE_STATE_WAIT);
+
 			} else {
 				Radio.Rx(RX_TIMEOUT_VALUE);
 			}
 		}break;
 		case NODE_STATE_WAIT: {
-			node_state = NODE_STATE_INIT;
+			APP_LOG(TS_ON, VLEVEL_L, "WAIT_PHASE\n\r");
+			SetState(NODE_STATE_INIT);
+			QueueTrackingTask();
 		}break;
 		}
 #endif
 }
 
-static void OnledEvent(void *context)
-{
+//static void OnledEvent(void *context)
+//{
 //  HAL_GPIO_TogglePin(LED2_GPIO_Port, LED2_Pin); /* LED_GREEN */
 //  HAL_GPIO_TogglePin(LED3_GPIO_Port, LED3_Pin); /* LED_RED */
 //  UTIL_TIMER_Start(&timerLed);
+//}
+
+static void OnTimeoutEvent(void *context)
+{
+	APP_LOG(TS_ON, VLEVEL_L, "TIMEOUT\n\r");
+	SetState(NODE_STATE_INIT);
+}
+
+static void ErrorHandler(char* errorMsg) {
+	APP_LOG(TS_ON, VLEVEL_L, "ERROR: %s", errorMsg);
+	SetState(NODE_STATE_INIT);
+}
+
+static void UpdateState() {
+	node_state = next_state;
+}
+
+static void SetState(NodeState_t new_state) {
+	next_state = new_state;
+	UpdateState();
+}
+
+static void QueueTrackingTask() {
+	UTIL_SEQ_SetTask((1 << CFG_SEQ_Task_SubGHz_Phy_App_Process), CFG_SEQ_Prio_0);
 }
 
 /* USER CODE END PrFD */
