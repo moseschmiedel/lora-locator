@@ -1,7 +1,7 @@
 /* USER CODE BEGIN Header */
 /**
   ******************************************************************************
-  * @file    app_subghz_phy.c
+  * @file    app_lora_locator.c
   * @author  MCD Application Team
   * @brief   Application of the SubGHz_Phy Middleware
   ******************************************************************************
@@ -19,8 +19,8 @@
 /* USER CODE END Header */
 
 /* Includes ------------------------------------------------------------------*/
-#include "app_subghz_phy.h"
-#include "subghz_phy_app.h"
+#include "app_lora_locator.h"
+#include "lora_locator_app.h"
 #include "sys_app.h"
 #include "stm32_seq.h"
 

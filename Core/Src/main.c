@@ -18,14 +18,14 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
-#include "app_subghz_phy.h"
+#include "app_lora_locator.h"
 #include "tim.h"
 #include "gpio.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "sys_app.h"
-#include "subghz_phy_app.h"
+#include "lora_locator_app.h"
 
 /* USER CODE END Includes */
 

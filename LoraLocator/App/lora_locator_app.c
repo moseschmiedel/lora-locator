@@ -1,7 +1,7 @@
 /* USER CODE BEGIN Header */
 /**
   ******************************************************************************
-  * @file    subghz_phy_app.c
+  * @file    lora_locator_app.c
   * @author  MCD Application Team
   * @brief   Application of the SubGHz_Phy Middleware
   ******************************************************************************
@@ -21,7 +21,7 @@
 /* Includes ------------------------------------------------------------------*/
 #include "platform.h"
 #include "sys_app.h"
-#include "subghz_phy_app.h"
+#include "lora_locator_app.h"
 #include "radio.h"
 
 /* USER CODE BEGIN Includes */
@@ -352,7 +352,7 @@ void SubghzApp_Init(void)
   Radio.SetMaxPayloadLength(MODEM_FSK, MAX_APP_BUFFER_SIZE);
 
 #else
-#error "Please define a modulation in the subghz_phy_app.h file."
+#error "Please define a modulation in the lora_locator_app.h file."
 #endif /* USE_MODEM_LORA | USE_MODEM_FSK */
 
   /*fills tx buffer*/
