@@ -439,7 +439,7 @@ static void OnRxDone(uint8_t *payload, uint16_t size, int16_t rssi, int8_t LoraS
 			  last_beacon_c_trk_res = packet;
 		  } break;
 		  }
-		  APP_LOG(TS_ON, VLEVEL_M, "Received packet from %u with RSSI=%d.\n\r", packet.device, packet.recv_rssi);
+		  APP_LOG(TS_ON, VLEVEL_M, "Recv Packet, %u, %d\n\r", packet.device, packet.recv_rssi);
 	  } else {
 		  ErrorHandler("Received packet which was too short.\n\r");
 	  }
