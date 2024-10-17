@@ -1,27 +1,28 @@
 /* USER CODE BEGIN Header */
 /**
-  ******************************************************************************
-  * @file    lora_locator_app.c
-  * @author  MCD Application Team
-  * @brief   Application of the SubGHz_Phy Middleware
-  ******************************************************************************
-  * @attention
-  *
-  * Copyright (c) 2021 STMicroelectronics.
-  * All rights reserved.
-  *
-  * This software is licensed under terms that can be found in the LICENSE file
-  * in the root directory of this software component.
-  * If no LICENSE file comes with this software, it is provided AS-IS.
-  *
-  ******************************************************************************
-  */
+ ******************************************************************************
+ * @file    lora_locator_app.c
+ * @author  MCD Application Team
+ * @brief   Application of the SubGHz_Phy Middleware
+ ******************************************************************************
+ * @attention
+ *
+ * Copyright (c) 2021 STMicroelectronics.
+ * All rights reserved.
+ *
+ * This software is licensed under terms that can be found in the LICENSE file
+ * in the root directory of this software component.
+ * If no LICENSE file comes with this software, it is provided AS-IS.
+ *
+ ******************************************************************************
+ */
 /* USER CODE END Header */
 
 /* Includes ------------------------------------------------------------------*/
 #include "platform.h"
 #include "sys_app.h"
 #include "lora_locator_app.h"
+#include "lora_locator_conf.h"
 #include "radio.h"
 
 /* USER CODE BEGIN Includes */
@@ -47,46 +48,92 @@
 /* USER CODE BEGIN PTD */
 typedef enum
 {
-  RX,
-  RX_TIMEOUT,
-  RX_ERROR,
-  TX,
-  TX_TIMEOUT,
+    RX,
+    RX_TIMEOUT,
+    RX_ERROR,
+    TX,
+    TX_TIMEOUT,
 } States_t;
 
 typedef enum {
-	TAG,
-	BEACONA,
-	BEACONB,
-	BEACONC,
+    TAG = 'T',
+    BEACONA = 'A',
+    BEACONB = 'B',
+    BEACONC = 'C',
 } Device_t;
 
+/**
+ * @brief Discriminator between possible packet types. Value for one packet type
+ * must not change between software versions, otherwise backwards compatibility
+ * would break.
+ */
+typedef enum {
+    PACKET_TYPE_PING = 1,
+    PACKET_TYPE_ACK = 2,
+    PACKET_TYPE_ANCHOR_RESPONSE = 3,
+} PacketType_t;
+
 typedef struct {
-	Device_t device;
-	uint8_t id;
-} TrackRequest_t;
+    PacketType_t packet_type;
+    uint8_t device_id;
+    uint8_t packet_id;
+} Ping_t;
 
-#define TRACK_REQUEST_SIZE 2
+#define PING_SIZE 3
+
+/**
+ * @note Even though there is a discriminator defined for AnchorResponse_t
+ * packet type it is not used, because the packet type can already determined
+ * by the packet size.
+ */
+typedef struct {
+    Device_t anchor_id;
+    uint8_t packet_id;
+    int16_t recv_rssi;
+} AnchorResponse_t;
+
+#define ANCHOR_RESPONSE_SIZE 4
 
 typedef struct {
-	Device_t device;
-	uint8_t id;
-	int16_t recv_rssi;
-} TrackResponse_t;
+    PacketType_t packet_type;
+    Device_t receiver_id;
+    uint8_t packet_id;
+} Ack_t;
 
-#define TRACK_RESPONSE_SIZE 4
+#define ACK_SIZE 3
 
 typedef enum {
-	NODE_STATE_INIT,
-	NODE_STATE_TRACK_REQ_PHASE,
-	NODE_STATE_TRACK_RES_PHASE,
-	NODE_STATE_WAIT,
+    NODE_STATE_INIT,
+    NODE_STATE_INTERVAL_START,
+    NODE_STATE_RX_END,
+    NODE_STATE_TX_END,
 } NodeState_t;
 
-static NodeState_t node_state = NODE_STATE_INIT;
-static NodeState_t next_state = NODE_STATE_INIT;
+typedef enum {
+    RESULT_OK,
+    RESULT_ERROR,
+} ResultState_t;
 
-static UTIL_TIMER_Object_t timerTimeout;
+typedef struct {
+    int16_t rssi;
+    uint16_t payload_size;
+    int8_t snr;
+} RxMeta_t;
+
+typedef struct {
+    ResultState_t state;
+    char* msg;
+    PacketType_t packet_type;
+    void* packet;
+    RxMeta_t metadata;
+} RxResult_t;
+
+typedef struct {
+    ResultState_t state;
+    char* msg;
+    PacketType_t packet_type;
+    void* packet;
+} TxResult_t;
 
 /* USER CODE END PTD */
 
@@ -94,10 +141,18 @@ static UTIL_TIMER_Object_t timerTimeout;
 /* USER CODE BEGIN PD */
 /* Configurations */
 /*Timeout*/
-#define RX_TIMEOUT_VALUE              3000
-#define TX_TIMEOUT_VALUE              3000
+#define RX_TIMEOUT_MS               200
+#define PING_TIMEOUT_MS             200
+#define ACK_TIMEOUT_MS              400
+#define TX_TIMEOUT_MS               200
+// 1200ms Timeout because End node sends Ping_t every 1000ms, so if a sending Endnode exists a Ping_t must be received in interval of 1200ms
+#define ACQUIRE_PING_TIMEOUT_MS     1200
 
-#define TIMEOUT_PERIOD_MS			  400
+#define INTERVAL_PERIOD_MS          1000
+/* Listen Period*/
+#define LISTEN_PERIOD_MS            200
+
+#define MAX_ANCHOR_RESPONSE_RETRIES   3
 
 /*Size of the payload to be sent*/
 /* Size must be greater of equal the PING and PONG*/
@@ -109,8 +164,13 @@ static UTIL_TIMER_Object_t timerTimeout;
 #define RX_TIME_MARGIN                200
 /* Afc bandwidth in Hz */
 #define FSK_AFC_BANDWIDTH             83333
-/* LED blink Period*/
-#define LED_PERIOD_MS                 200
+
+#if (IS_ANCHOR_NODE == 1 && IS_END_NODE == 0)
+#define SWITCH_DEVICE_TYPE(ANCHOR_CODE, END_NODE_CODE) #ANCHOR_CODE;
+#elif (IS_ANCHOR_NODE == 0 && IS_END_NODE == 1)
+#define SWITCH_DEVICE_TYPE(ANCHOR_CODE, END_NODE_CODE) #END_NODE_CODE;
+#else
+#endif
 
 /* USER CODE END PD */
 
@@ -126,39 +186,158 @@ static RadioEvents_t RadioEvents;
 /* USER CODE BEGIN PV */
 /*Ping Pong FSM states */
 static States_t State = RX;
-/* App Rx Buffer*/
-static uint8_t BufferRx[MAX_APP_BUFFER_SIZE];
 /* App Tx Buffer*/
-static uint8_t BufferTx[MAX_APP_BUFFER_SIZE];
-/* Last  Received Buffer Size*/
-uint16_t RxBufferSize = 0;
-/* Last  Received packer Rssi*/
-int8_t RssiValue = 0;
-/* Last  Received packer SNR (in Lora modulation)*/
-int8_t SnrValue = 0;
-/* Led Timers objects*/
-/* device state. Master: true, Slave: false*/
-bool isMaster = true;
-/* random delay to make sure 2 devices will sync*/
-/* the closest the random delays are, the longer it will
-   take for the devices to sync when started simultaneously*/
+static uint8_t tx_buffer[MAX_APP_BUFFER_SIZE];
+
+/** @brief State variable that records from which context the node entered
+ * the core function `LoraLocator_Process`.
+ */
+static NodeState_t node_state = NODE_STATE_INIT;
+
+/** @brief Result of a RX operation. */
+static RxResult_t rx_result;
+/** @brief Result of a TX operation. */
+static TxResult_t tx_result;
+
+/** @brief Last received `AnchorResponse_t`. */
+static AnchorResponse_t rx_anchor_response;
+/** @brief Last transmitted `AnchorResponse_t`. */
+static AnchorResponse_t tx_anchor_response;
+/** @brief Track how often `AnchorResponse_t` transmission was retried. */
+static uint8_t anchor_response_retries = 0;
+
+/** @brief Last received `Ping_t`. */
+static Ping_t rx_ping;
+/** @brief RSSI value of last received `Ping_t`. */
+static int16_t rx_ping_rssi;
+/** @brief Last transmitted `Ping_t`. */
+static Ping_t tx_ping;
+
+/** @brief Last received `Ack_t`. */
+static Ack_t rx_ack;
+/** @brief Last transmitted `Ack_t`. */
+static Ack_t tx_ack;
+
+/** @brief Timer that triggers `LoraLocator_Process` periodically to either transmit a `Ping_t` (end node) or listen for a `Ping_t` (anchor node). */
+static UTIL_TIMER_Object_t interval_timer;
+/** @brief Timer that limits the time spent per interval listening for incoming transmissions. Transceiver is put in sleep mode after `listen_timer` timeout. */
+static UTIL_TIMER_Object_t listen_timer;
+
+/** @brief Random delay to make sure 2 devices will sync
+ *  the closest the random delays are, the longer it will
+ *  take for the devices to sync when started simultaneously
+ */
 static int32_t random_delay;
-
-static TrackResponse_t last_beacon_a_trk_res;
-static TrackResponse_t last_beacon_b_trk_res;
-static TrackResponse_t last_beacon_c_trk_res;
-
-uint8_t last_id = 0;
-int16_t last_rssi = 0;
 
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 
-/**
- * @brief Updates the `node_state` global with the new state value configured in `next_state`.
+/*!
+ * @brief Function to be executed on Radio Tx Done event
  */
-static void UpdateState();
+static void OnTxDone(void);
+
+/**
+ * @brief Function to be executed on Radio Rx Done event
+ * @param  payload ptr of buffer received
+ * @param  size buffer size
+ * @param  rssi
+ * @param  LoraSnr_FskCfo
+ */
+static void OnRxDone(uint8_t *payload, uint16_t size, int16_t rssi, int8_t LoraSnr_FskCfo);
+
+/**
+ * @brief Function executed on Radio Tx Timeout event
+ */
+static void OnTxTimeout(void);
+
+/**
+ * @brief Function executed on Radio Rx Timeout event
+ */
+static void OnRxTimeout(void);
+
+/**
+ * @brief Function executed on Radio Rx Error event
+ */
+static void OnRxError(void);
+
+/* USER CODE BEGIN PFP */
+/**
+ * @brief   Function executed when interval timer elapses
+ * @param context ptr of Timeout context
+ */
+static void OnIntervalEvent(void *context);
+
+/**
+ * @brief  Function executed on when listen timer elapses
+ * @param  context ptr of LED context
+ */
+static void OnListenEndEvent(void *context);
+
+/**
+ * @brief Create byte buffer with data from `EndNodeRequest_t`.
+ * @param buffer destination position of byte buffer
+ * @param packet data to encode
+ * @warn Caller must ensure that `buffer` can hold at least 2 elements.
+ */
+void encode_Ping(uint8_t *buffer, const Ping_t* packet);
+
+/**
+ * @brief Create `EndNodeRequest_t` with data encoded in byte buffer.
+ * @param packet pointer to `EndNodeRequest_t` where decoded `EndNodeRequest_t` should be stored.
+ * @param buffer Data encoded as byte buffer.
+ * @warn Caller must ensure that `buffer` has at least 2 elements.
+ */
+void decode_Ping(Ping_t *packet, const uint8_t *buffer);
+
+/**
+ * @brief Create byte buffer with data from `AnchorResponse_t`.
+ * @param buffer destination position of byte buffer
+ * @param packet data to encode
+ * @warn Caller must ensure that `buffer` can hold at least 4 elements.
+ */
+void encode_AnchorResponse(uint8_t* buffer, const AnchorResponse_t* packet);
+
+/**
+ * @brief Create `AnchorResponse_t` with data encoded in byte buffer.
+ * @param packet pointer to `AnchorResponse_t` where decoded `AnchorResponse_t` should be stored.
+ * @param buffer Data encoded as byte buffer.
+ * @warn Caller must ensure that `buffer` has at least 4 elements.
+ */
+void decode_AnchorResponse(AnchorResponse_t* packet, const uint8_t* buffer);
+
+/**
+ * @brief Create byte buffer with data from `Ack_t`.
+ * @param buffer destination position of byte buffer
+ * @param packet data to encode
+ * @warn Caller must ensure that `buffer` can hold at least 3 elements.
+ */
+void encode_Ack(uint8_t* buffer, const Ack_t* packet);
+
+/**
+ * @brief Create `Ack_t` with data encoded in byte buffer.
+ * @param pointer to `Ack_t` where decoded `Ack_t` should be stored.
+ * @param buffer Data encoded as byte buffer.
+ * @warn Caller must ensure that `buffer` has at least 3 elements.
+ */
+void decode_Ack(Ack_t* ack, const uint8_t* buffer);
+
+void send_ping();
+void send_anchor_response(const Ping_t* ping, int16_t rssi);
+void acknowledge_packet(const AnchorResponse_t* anchor_response);
+
+/**
+ * @brief Estimate the current position from 3 TrackRepsonses from different Beacons.
+ * @param a `AnchorResponse_t` from first Beacon.
+ * @param b `AnchorResponse_t` from second Beacon.
+ * @param c `AnchorResponse_t` from third Beacon.
+ */
+void estimate_position(const AnchorResponse_t* a, const AnchorResponse_t* b, const AnchorResponse_t* c);
+
+/*
+ * State management, scheduling, debug/info helpers
+ */
 
 /**
  * @brief Sets the `node_state` global to `new_state`.
@@ -169,518 +348,592 @@ static void SetState(NodeState_t new_state);
 /**
  * @brief Add `TrackingProcess` to UTIL_SEQ task-queue. (Queue `TrackingProcess` for execution.)
  */
-static void QueueTrackingTask();
+static void QueueLoraLocatorTask();
+
+char* pt_toString(PacketType_t packet_type);
 
 /**
- * @brief Function to call when an error occurs
- * @param errorMsg Short string which explains the error.
+ * @brief Print information about device and radio configuration. Called on initialization.
  */
-static void ErrorHandler(char* errorMsg);
-
-/*!
- * @brief Function to be executed on Radio Tx Done event
- */
-static void OnTxDone(void);
-
-/**
-  * @brief Function to be executed on Radio Rx Done event
-  * @param  payload ptr of buffer received
-  * @param  size buffer size
-  * @param  rssi
-  * @param  LoraSnr_FskCfo
-  */
-static void OnRxDone(uint8_t *payload, uint16_t size, int16_t rssi, int8_t LoraSnr_FskCfo);
-
-/**
-  * @brief Function executed on Radio Tx Timeout event
-  */
-static void OnTxTimeout(void);
-
-/**
-  * @brief Function executed on Radio Rx Timeout event
-  */
-static void OnRxTimeout(void);
-
-/**
-  * @brief Function executed on Radio Rx Error event
-  */
-static void OnRxError(void);
-
-/* USER CODE BEGIN PFP */
-/**
-  * @brief  Function executed on when led timer elapses
-  * @param  context ptr of LED context
-  */
-static void OnledEvent(void *context);
-
-/**
- * @brief   Function executed when timeout timer elapses
- * @param context ptr of Timeout context
- */
-static void OnTimeoutEvent(void *context);
-
-/**
-  * @brief Tracking state machine implementation
-  */
-//static void Tracking_Process(void);
-
-/**
- * @brief Create byte buffer with data from `TrackRequest_t`.
- * @param buffer destination position of byte buffer
- * @param packet data to encode
- * @warn Caller must ensure that `buffer` can hold at least 2 elements.
- */
-void encode_track_request(uint8_t *buffer, TrackRequest_t packet);
-
-/**
- * @brief Create `TrackRequest_t` with data encoded in byte buffer.
- * @param packet pointer to `TrackRequest_t` where decoded `TrackRequest_t` should be stored.
- * @param buffer Data encoded as byte buffer.
- * @warn Caller must ensure that `buffer` has at least 2 elements.
- */
-void decode_track_request(TrackRequest_t *packet, uint8_t *buffer);
-
-/**
- * @brief Create byte buffer with data from `TrackResponse_t`.
- * @param buffer destination position of byte buffer
- * @param packet data to encode
- * @warn Caller must ensure that `buffer` can hold at least 4 elements.
- */
-void encode_track_response(uint8_t *buffer, TrackResponse_t packet);
-
-/**
- * @brief Create `TrackResponse_t` with data encoded in byte buffer.
- * @param packet pointer to `TrackResponse_t` where decoded `TrackResponse_t` should be stored.
- * @param buffer Data encoded as byte buffer.
- * @warn Caller must ensure that `buffer` has at least 4 elements.
- */
-void decode_track_response(TrackResponse_t *packet, uint8_t *buffer);
-
-/**
- * @brief Estimate the current position from 3 TrackRepsonses from different Beacons.
- * @param a `TrackResponse_t` from first Beacon.
- * @param b `TrackResponse_t` from second Beacon.
- * @param c `TrackResponse_t` from third Beacon.
- */
-void estimate_position(TrackResponse_t a, TrackResponse_t b, TrackResponse_t c);
+static void print_metadata();
 
 /* USER CODE END PFP */
 
 /* Exported functions ---------------------------------------------------------*/
-void SubghzApp_Init(void)
+void LoraLocator_Init(void)
 {
-  /* USER CODE BEGIN SubghzApp_Init_1 */
-	/* Set verbose-level for debug printing
-	 * VLEVEL_H = All error and debug messages.
-	 * VLEVEL_M = Data output (RSSI readings) and critical messages.
-	 * VLEVEL_L = Only critical messages.
-	 */
-	UTIL_ADV_TRACE_SetVerboseLevel(VLEVEL_M);
+    /* USER CODE BEGIN SubghzApp_Init_1 */
+    LoraLocator_Config();
 
-  APP_LOG(TS_OFF, VLEVEL_M, "\n\rLoRa Locator\n\r");
-  /* Get SubGHY_Phy APP version*/
-  APP_LOG(TS_OFF, VLEVEL_M, "APPLICATION_VERSION: V%X.%X.%X\r\n",
-          (uint8_t)(APP_VERSION_MAIN),
-          (uint8_t)(APP_VERSION_SUB1),
-          (uint8_t)(APP_VERSION_SUB2));
-
-  /* Get MW SubGhz_Phy info */
-  APP_LOG(TS_OFF, VLEVEL_M, "MW_RADIO_VERSION:    V%X.%X.%X\r\n",
-          (uint8_t)(SUBGHZ_PHY_VERSION_MAIN),
-          (uint8_t)(SUBGHZ_PHY_VERSION_SUB1),
-          (uint8_t)(SUBGHZ_PHY_VERSION_SUB2));
-
-  /* Led Timers*/
-  if (UTIL_TIMER_Create(&timerTimeout, TIMEOUT_PERIOD_MS, UTIL_TIMER_ONESHOT, OnTimeoutEvent, NULL) != UTIL_TIMER_OK) {
-	  APP_LOG(TS_ON, VLEVEL_H, "Could not create timeout timer.\n\r");
-  }
-//  UTIL_TIMER_Create(&timerLed, LED_PERIOD_MS, UTIL_TIMER_ONESHOT, OnledEvent, NULL);
-//  UTIL_TIMER_Start(&timerLed);
-  /* USER CODE END SubghzApp_Init_1 */
-
-  /* Radio initialization */
-  RadioEvents.TxDone = OnTxDone;
-  RadioEvents.RxDone = OnRxDone;
-  RadioEvents.TxTimeout = OnTxTimeout;
-  RadioEvents.RxTimeout = OnRxTimeout;
-  RadioEvents.RxError = OnRxError;
-
-  Radio.Init(&RadioEvents);
-
-  /* USER CODE BEGIN SubghzApp_Init_2 */
-  /*calculate random delay for synchronization*/
-  random_delay = (Radio.Random()) >> 22; /*10bits random e.g. from 0 to 1023 ms*/
-
-  /* Radio Set frequency */
-  Radio.SetChannel(RF_FREQUENCY);
-
-  /* Radio configuration */
-#if ((USE_MODEM_LORA == 1) && (USE_MODEM_FSK == 0))
-  APP_LOG(TS_OFF, VLEVEL_M, "---------------\n\r");
-  APP_LOG(TS_OFF, VLEVEL_M, "LORA_MODULATION\n\r");
-  APP_LOG(TS_OFF, VLEVEL_M, "LORA_BW=%d kHz\n\r", (1 << LORA_BANDWIDTH) * 125);
-  APP_LOG(TS_OFF, VLEVEL_M, "LORA_SF=%d\n\r", LORA_SPREADING_FACTOR);
-
-  Radio.SetTxConfig(MODEM_LORA, TX_OUTPUT_POWER, 0, LORA_BANDWIDTH,
-                    LORA_SPREADING_FACTOR, LORA_CODINGRATE,
-                    LORA_PREAMBLE_LENGTH, LORA_FIX_LENGTH_PAYLOAD_ON,
-                    true, 0, 0, LORA_IQ_INVERSION_ON, TX_TIMEOUT_VALUE);
-
-  Radio.SetRxConfig(MODEM_LORA, LORA_BANDWIDTH, LORA_SPREADING_FACTOR,
-                    LORA_CODINGRATE, 0, LORA_PREAMBLE_LENGTH,
-                    LORA_SYMBOL_TIMEOUT, LORA_FIX_LENGTH_PAYLOAD_ON,
-                    0, true, 0, 0, LORA_IQ_INVERSION_ON, true);
-
-  Radio.SetMaxPayloadLength(MODEM_LORA, MAX_APP_BUFFER_SIZE);
-
-#elif ((USE_MODEM_LORA == 0) && (USE_MODEM_FSK == 1))
-  APP_LOG(TS_OFF, VLEVEL_M, "---------------\n\r");
-  APP_LOG(TS_OFF, VLEVEL_M, "FSK_MODULATION\n\r");
-  APP_LOG(TS_OFF, VLEVEL_M, "FSK_BW=%d Hz\n\r", FSK_BANDWIDTH);
-  APP_LOG(TS_OFF, VLEVEL_M, "FSK_DR=%d bits/s\n\r", FSK_DATARATE);
-
-  Radio.SetTxConfig(MODEM_FSK, TX_OUTPUT_POWER, FSK_FDEV, 0,
-                    FSK_DATARATE, 0,
-                    FSK_PREAMBLE_LENGTH, FSK_FIX_LENGTH_PAYLOAD_ON,
-                    true, 0, 0, 0, TX_TIMEOUT_VALUE);
-
-  Radio.SetRxConfig(MODEM_FSK, FSK_BANDWIDTH, FSK_DATARATE,
-                    0, FSK_AFC_BANDWIDTH, FSK_PREAMBLE_LENGTH,
-                    0, FSK_FIX_LENGTH_PAYLOAD_ON, 0, true,
-                    0, 0, false, true);
-
-  Radio.SetMaxPayloadLength(MODEM_FSK, MAX_APP_BUFFER_SIZE);
-
+    /* Timers */
+#if IS_ANCHOR_NODE == 0 && IS_END_NODE == 1
+    if (UTIL_TIMER_Create(&interval_timer, INTERVAL_PERIOD_MS, UTIL_TIMER_PERIODIC, &OnIntervalEvent, NULL) != UTIL_TIMER_OK) {
+        APP_LOG(TS_ON, VLEVEL_M, "Could not create interval timer.\n\r");
+    }
+#elif IS_ANCHOR_NODE == 1 && IS_END_NODE == 0
+    // make interval_timer slightly shorter on anchor node to ensure anchor is already in receiver mode when end node starts transmitting
+    if (UTIL_TIMER_Create(&interval_timer, INTERVAL_PERIOD_MS-100, UTIL_TIMER_PERIODIC, &OnIntervalEvent, NULL) != UTIL_TIMER_OK) {
+        APP_LOG(TS_ON, VLEVEL_M, "Could not create interval timer.\n\r");
+    }
 #else
-#error "Please define a modulation in the lora_locator_app.h file."
-#endif /* USE_MODEM_LORA | USE_MODEM_FSK */
+#error "Set atleast/only one of IS_ANCHOR_NODE and IS_END_NODE to 1."
+#endif
+    if (UTIL_TIMER_Create(&listen_timer, LISTEN_PERIOD_MS, UTIL_TIMER_ONESHOT, &OnListenEndEvent, NULL) != UTIL_TIMER_OK) {
+        APP_LOG(TS_ON, VLEVEL_M, "Could not create listen timer.\n\r");
+    }
+    /* USER CODE END SubghzApp_Init_1 */
 
-  /*fills tx buffer*/
-  memset(BufferTx, 0x0, MAX_APP_BUFFER_SIZE);
+    /* Radio initialization */
+    RadioEvents.TxDone = &OnTxDone;
+    RadioEvents.RxDone = &OnRxDone;
+    RadioEvents.TxTimeout = &OnTxTimeout;
+    RadioEvents.RxTimeout = &OnRxTimeout;
+    RadioEvents.RxError = &OnRxError;
 
-  APP_LOG(TS_ON, VLEVEL_H, "rand=%d\n\r", random_delay);
-  /*starts reception*/
-  Radio.Rx(RX_TIMEOUT_VALUE + random_delay);
+    Radio.Init(&RadioEvents);
 
-  /*register task to to be run in while(1) after Radio IT*/
-  UTIL_SEQ_RegTask((1 << CFG_SEQ_Task_SubGHz_Phy_App_Process), UTIL_SEQ_RFU, Tracking_Process);
-  /* USER CODE END SubghzApp_Init_2 */
+    /* USER CODE BEGIN SubghzApp_Init_2 */
+    /*calculate random delay for synchronization*/
+    random_delay = (Radio.Random()) >> 22; /*10bits random e.g. from 0 to 1023 ms*/
+
+    /* Radio Set frequency */
+    Radio.SetChannel(RF_FREQUENCY);
+
+    /* Radio configuration */
+    Radio.SetTxConfig(MODEM_LORA, TX_OUTPUT_POWER, 0, LORA_BANDWIDTH,
+            LORA_SPREADING_FACTOR, LORA_CODINGRATE,
+            LORA_PREAMBLE_LENGTH, LORA_FIX_LENGTH_PAYLOAD_ON,
+            true, 0, 0, LORA_IQ_INVERSION_ON, TX_TIMEOUT_MS);
+
+    Radio.SetRxConfig(MODEM_LORA, LORA_BANDWIDTH, LORA_SPREADING_FACTOR,
+            LORA_CODINGRATE, 0, LORA_PREAMBLE_LENGTH,
+            LORA_SYMBOL_TIMEOUT, LORA_FIX_LENGTH_PAYLOAD_ON,
+            0, true, 0, 0, LORA_IQ_INVERSION_ON, true);
+
+    Radio.SetMaxPayloadLength(MODEM_LORA, MAX_APP_BUFFER_SIZE);
+
+    /*fills tx buffer*/
+    memset(tx_buffer, 0x0, MAX_APP_BUFFER_SIZE);
+
+    print_metadata();
+
+    /*register task to to be run in while(1) after Radio IT*/
+    UTIL_SEQ_RegTask((1 << CFG_SEQ_Task_SubGHz_Phy_App_Process), UTIL_SEQ_RFU, LoraLocator_Process);
+    QueueLoraLocatorTask();
+    /* USER CODE END SubghzApp_Init_2 */
 }
 
 /* USER CODE BEGIN EF */
+
+/*
+ * Event handlers
+ */
+
+static void OnListenEndEvent(void* context) {
+    // Exit Rx mode
+    Radio.Standby();
+    // Enter Sleep mode
+    Radio.Sleep();
+}
+
+static void OnIntervalEvent(void *context)
+{
+    SetState(NODE_STATE_INTERVAL_START);
+    QueueLoraLocatorTask();
+}
 
 /* USER CODE END EF */
 
 /* Private functions ---------------------------------------------------------*/
 static void OnTxDone(void)
 {
-  /* USER CODE BEGIN OnTxDone */
-  APP_LOG(TS_ON, VLEVEL_H, "OnTxDone\n\r");
-  /* Update the State of the FSM*/
-  State = TX;
-  /* State change point for `node_state` FSM */
-  UpdateState();
-  /* Run PingPong process in background*/
-  QueueTrackingTask();
-  /* USER CODE END OnTxDone */
+    /* USER CODE BEGIN OnTxDone */
+    /* Update the State of the FSM*/
+    State = TX;
+    switch (tx_result.packet_type) {
+    case PACKET_TYPE_PING: {
+        const Ping_t* ping = (Ping_t*) tx_result.packet;
+        APP_LOG(TS_ON, VLEVEL_L, ", TX, Ping, %u, %u,,\n\r", ping->device_id, ping->packet_id);
+    }break;
+    case PACKET_TYPE_ANCHOR_RESPONSE: {
+        const AnchorResponse_t* r = (AnchorResponse_t*) tx_result.packet;
+        APP_LOG(TS_ON, VLEVEL_L, ", TX, AnchorResponse, %c, %u, %d\n\r", r->anchor_id, r->packet_id, r->recv_rssi);
+    }break;
+    case PACKET_TYPE_ACK: {
+        const Ack_t* ack = (Ack_t*) tx_result.packet;
+        APP_LOG(TS_ON, VLEVEL_L, ", TX, Ack, %c, %u,,\n\r", ack->receiver_id, ack->packet_id);
+    }break;
+    }
+    /* Tx was successful */
+    tx_result.state = RESULT_OK;
+    /* State change point for `node_state` FSM */
+    SetState(NODE_STATE_TX_END);
+    /* Run PingPong process in background*/
+    QueueLoraLocatorTask();
+    /* USER CODE END OnTxDone */
 }
 
 static void OnRxDone(uint8_t *payload, uint16_t size, int16_t rssi, int8_t LoraSnr_FskCfo)
 {
-  /* USER CODE BEGIN OnRxDone */
-  APP_LOG(TS_ON, VLEVEL_H, "OnRxDone\n\r");
-#if ((USE_MODEM_LORA == 1) && (USE_MODEM_FSK == 0))
-  APP_LOG(TS_ON, VLEVEL_H, "RssiValue=%d dBm, SnrValue=%ddB\n\r", rssi, LoraSnr_FskCfo);
-  /* Record payload Signal to noise ratio in Lora*/
-  SnrValue = LoraSnr_FskCfo;
-#endif /* USE_MODEM_LORA | USE_MODEM_FSK */
-#if ((USE_MODEM_LORA == 0) && (USE_MODEM_FSK == 1))
-  APP_LOG(TS_ON, VLEVEL_H, "RssiValue=%d dBm, Cfo=%dkHz\n\r", rssi, LoraSnr_FskCfo);
-  SnrValue = 0; /*not applicable in GFSK*/
-#endif /* USE_MODEM_LORA | USE_MODEM_FSK */
-  /* Update the State of the FSM*/
-  State = RX;
-  /* Clear BufferRx*/
-  memset(BufferRx, 0, MAX_APP_BUFFER_SIZE);
-  /* Record payload size*/
-  RxBufferSize = size;
-  if (RxBufferSize <= MAX_APP_BUFFER_SIZE)
-  {
-    memcpy(BufferRx, payload, RxBufferSize);
-  }
+    /* USER CODE BEGIN OnRxDone */
+    /* Update the State of the FSM*/
+    State = RX;
 
-#if IS_BEACON_DEVICE == 1
-  if (node_state == NODE_STATE_TRACK_REQ_PHASE) {
-	  if (size >= 2) {
-		  TrackRequest_t packet;
-		  decode_track_request(&packet, payload);
-		  last_id = packet.id;
-		  last_rssi = rssi;
-	  } else {
-		  ErrorHandler("Received packet which was too short.\n\r");
-	  }
-  } else {
-	  ErrorHandler("Received packet in wrong `node_state`.\n\r");
-  }
-#elif IS_TAG_DEVICE == 1
-  if (node_state == NODE_STATE_TRACK_RES_PHASE) {
-	  if (size >= 4) {
-		  TrackResponse_t packet;
-		  decode_track_response(&packet, payload);
+    /* Record payload Signal to noise ratio in Lora*/
+    rx_result.metadata.snr = LoraSnr_FskCfo;
+    /* Record payload size*/
+    rx_result.metadata.payload_size = size;
+    /* Record Received Signal Strength*/
+    rx_result.metadata.rssi = rssi;
 
-		  switch (packet.device) {
-		  case BEACONA: {
-			  last_beacon_a_trk_res = packet;
-		  } break;
-		  case BEACONB: {
-			  last_beacon_b_trk_res = packet;
-		  } break;
-		  case BEACONC: {
-			  last_beacon_c_trk_res = packet;
-		  } break;
-		  }
-		  APP_LOG(TS_ON, VLEVEL_M, "Recv Packet, %u, %d\n\r", packet.device, packet.recv_rssi);
-	  } else {
-		  ErrorHandler("Received packet which was too short.\n\r");
-	  }
-  } else {
-	  ErrorHandler("Received packet in wrong `node_state`.\n\r");
-  }
+#if IS_ANCHOR_NODE == 0 && IS_END_NODE == 1
+    if (size == ANCHOR_RESPONSE_SIZE) {
+        rx_result.packet_type = PACKET_TYPE_ANCHOR_RESPONSE;
+        rx_result.state = RESULT_OK;
+        rx_result.packet = &rx_anchor_response;
+        decode_AnchorResponse(rx_result.packet, payload);
+        const AnchorResponse_t* r = (AnchorResponse_t*) rx_result.packet;
+        APP_LOG(TS_ON, VLEVEL_L, ", RX, AnchorResponse, %c, %u, %d\n\r", r->anchor_id, r->packet_id, r->recv_rssi);
+    } else {
+        rx_result.state = RESULT_ERROR;
+        rx_result.msg = "Could not decode received packet it had incorrect length.";
+    }
+#elif IS_ANCHOR_NODE == 1 && IS_END_NODE == 0
+    if (size == PING_SIZE) {
+        if (payload[0] == PACKET_TYPE_PING) {
+            rx_result.packet_type = PACKET_TYPE_PING;
+            rx_result.packet = &rx_ping;
+            decode_Ping(rx_result.packet, payload);
+
+            if (rx_result.packet == NULL) {
+                rx_result.state = RESULT_ERROR;
+                rx_result.msg = "Could not decode received packet because of wrong format.";
+            } else {
+                rx_result.state = RESULT_OK;
+                rx_ping_rssi = rssi;
+                APP_LOG(TS_ON, VLEVEL_L, ", RX, Ping, %u, %u, %d.\n\r", ((Ping_t*) rx_result.packet)->device_id, ((Ping_t*) rx_result.packet)->packet_id, rx_ping_rssi);
+            }
+        } else if (payload[0] == PACKET_TYPE_ACK) {
+            rx_result.packet_type = PACKET_TYPE_ACK;
+            rx_result.packet = &rx_ack;
+            decode_Ack(rx_result.packet, payload);
+
+            if (rx_result.packet == NULL) {
+                rx_result.state = RESULT_ERROR;
+                rx_result.msg = "Could not decode received packet because of wrong format.";
+            } else {
+                rx_result.state = RESULT_OK;
+                APP_LOG(TS_ON, VLEVEL_L, ", RX, Ack, %c, %u,,\n\r", ((Ack_t*) rx_result.packet)->receiver_id, ((Ack_t*) rx_result.packet)->packet_id);
+            }
+        } else {
+            rx_result.state = RESULT_ERROR;
+            rx_result.msg = "Could not decode received packet it had incorrect discriminator.";
+        }
+    } else {
+        rx_result.state = RESULT_ERROR;
+        rx_result.msg = "Could not decode received packet it had incorrect length.";
+    }
+#else
+#error "Set atleast/only one of IS_ANCHOR_NODE and IS_END_NODE to 1."
 #endif
 
-  /* Record Received Signal Strength*/
-  RssiValue = rssi;
-  /* Record payload content*/
+    /* State change point for `node_state` FSM */
+    SetState(NODE_STATE_RX_END);
 
-  /* State change point for `node_state` FSM */
-  UpdateState();
-
-  /* Run PingPong process in background*/
-  QueueTrackingTask();
-  /* USER CODE END OnRxDone */
+    /* Run PingPong process in background*/
+    QueueLoraLocatorTask();
+    /* USER CODE END OnRxDone */
 }
 
 static void OnTxTimeout(void)
 {
-  /* USER CODE BEGIN OnTxTimeout */
-  /* Update the State of the FSM*/
-  State = TX_TIMEOUT;
-  ErrorHandler("TX Timeout\n\r");
-  /* Run PingPong process in background*/
-  QueueTrackingTask();
-  /* USER CODE END OnTxTimeout */
+    /* USER CODE BEGIN OnTxTimeout */
+    /* Update the State of the FSM*/
+    State = TX_TIMEOUT;
+    SetState(NODE_STATE_TX_END);
+    tx_result.state = RESULT_ERROR;
+    tx_result.msg = "TxError: TX Timeout.";
+    /* Run PingPong process in background*/
+    QueueLoraLocatorTask();
+    /* USER CODE END OnTxTimeout */
 }
 
 static void OnRxTimeout(void)
 {
-  /* USER CODE BEGIN OnRxTimeout */
-  /* Update the State of the FSM*/
-  State = RX_TIMEOUT;
-  ErrorHandler("RX Timeout\n\r");
-  /* Run PingPong process in background*/
-  QueueTrackingTask();
-  /* USER CODE END OnRxTimeout */
+    /* USER CODE BEGIN OnRxTimeout */
+    /* Update the State of the FSM*/
+    State = RX_TIMEOUT;
+    SetState(NODE_STATE_RX_END);
+    rx_result.state = RESULT_ERROR;
+    rx_result.msg = "RxError: RX Timeout.";
+    /* Run PingPong process in background*/
+    QueueLoraLocatorTask();
+    /* USER CODE END OnRxTimeout */
 }
 
 static void OnRxError(void)
 {
-  /* USER CODE BEGIN OnRxError */
-  /* Update the State of the FSM*/
-  State = RX_ERROR;
-  ErrorHandler("Error while receiving LoRa-packet.\n\r");
-  /* Run PingPong process in background*/
-  QueueTrackingTask();
-  /* USER CODE END OnRxError */
+    /* USER CODE BEGIN OnRxError */
+    /* Update the State of the FSM*/
+    State = RX_ERROR;
+
+    rx_result.state = RESULT_ERROR;
+    rx_result.msg = "RxError: Error during packet reception.";
+    SetState(NODE_STATE_RX_END);
+    /* Run PingPong process in background*/
+    QueueLoraLocatorTask();
+    /* USER CODE END OnRxError */
 }
 
 /* USER CODE BEGIN PrFD */
-void encode_track_request(uint8_t *buffer, TrackRequest_t packet) {
-	if (buffer == NULL) {
-		return;
-	}
 
-	buffer[0] = (uint8_t) packet.device;
-	buffer[1] = packet.id;
+#if (IS_ANCHOR_NODE == 0 && IS_END_NODE == 1)
+
+void LoraLocator_Process(void)
+{
+    /* Process can be entered from different states:
+     * 1) First execution of task     => NODE_STATE_INIT
+     * 2) Interval timer elapsed      => NODE_STATE_INTERVAL_START
+     * 3) After Rx()                  => NODE_STATE_RX_END
+     * 4) After Tx()                  => NODE_STATE_TX_END
+     *
+     * The state the process is entered from is recorded in the node_state variable.
+     */
+
+    switch(node_state) {
+    case NODE_STATE_INIT: {
+        /* End node:
+         * Start interval timer (start sending Ping_t)
+         */
+        UTIL_TIMER_StartWithPeriod(&interval_timer, INTERVAL_PERIOD_MS);
+    }break;
+    case NODE_STATE_INTERVAL_START: {
+        // End node: Send Ping_t
+        send_ping();
+    }break;
+    case NODE_STATE_RX_END: {
+        /* check if ERROR or SUCCESS
+         * SUCCESS@End node: Send ACK_t
+         * ERROR@End node: log error
+         */
+        if (rx_result.state == RESULT_OK) {
+            if (rx_result.packet_type == PACKET_TYPE_ANCHOR_RESPONSE) {
+                acknowledge_packet(rx_result.packet);
+            } else {
+                APP_LOG(TS_ON, VLEVEL_M, "RX Error: Unexpected packet type. Was %s, expected %s!\n\r", pt_toString(rx_result.packet_type), pt_toString(PACKET_TYPE_ANCHOR_RESPONSE));
+            }
+        } else {
+            APP_LOG(TS_ON, VLEVEL_M, "RX Error: %s\n\r", rx_result.msg);
+            Radio.Standby();
+            Radio.Sleep();
+        }
+    }break;
+    case NODE_STATE_TX_END: {
+        /* check if ERROR or SUCCESS
+         * SUCCESS@End node:
+         *   check if Ping_t or ACK_t:
+         *        Ping_t => start Rx() + start listen_timer
+         *        ACK_t => start Rx()
+         * ERROR@End node: (log error) +
+         *   check if Ping_t or ACK_t:
+         *        Ping_t => go to sleep (wait for next interval_start)
+         *        ACK_t => resend ACK_t? OR start Rx()
+         */
+         if (tx_result.state == RESULT_OK) {
+             if (tx_result.packet_type == PACKET_TYPE_PING) {
+                UTIL_TIMER_StartWithPeriod(&listen_timer, LISTEN_PERIOD_MS);
+             }
+             Radio.Rx(RX_TIMEOUT_MS);
+         } else {
+             APP_LOG(TS_ON, VLEVEL_M, "TX Error: %s\n\r", tx_result.msg);
+             if (tx_result.packet_type == PACKET_TYPE_PING) {
+                 Radio.Standby();
+                 Radio.Sleep();
+             } else {
+                 Radio.Rx(RX_TIMEOUT_MS);
+             }
+         }
+    }break;
+    }
 }
 
-void decode_track_request(TrackRequest_t *packet, uint8_t *buffer) {
-	if (buffer == NULL || packet == NULL) {
-		packet = NULL;
-		return;
-	}
-	if (buffer[0] > BEACONC) {
-		packet = NULL;
-		return;
-	}
+#elif (IS_ANCHOR_NODE == 1 && IS_END_NODE == 0)
 
-	packet->device = buffer[0];
-	packet->id = buffer[1];
+void LoraLocator_Process(void) {
+    /* Process can be entered from different states:
+     * 1) First execution of task     => NODE_STATE_INIT
+     * 2) Interval timer elapsed      => NODE_STATE_INTERVAL_START
+     * 3) After Rx()                  => NODE_STATE_RX_END
+     * 4) After Tx()                  => NODE_STATE_TX_END
+     *
+     * The state the process is entered from is recorded in the node_state variable.
+     */
+
+    switch(node_state) {
+    case NODE_STATE_INIT: {
+        /* Anchor:
+         * Listen for first Ping_t to synchronize own interval_timer with
+         * interval_timer of End node
+         */
+        Radio.Rx(ACQUIRE_PING_TIMEOUT_MS);
+    }break;
+    case NODE_STATE_INTERVAL_START: {
+        // Anchor: Listen for Ping_t with PING_TIMEOUT_MS
+        Radio.Rx(PING_TIMEOUT_MS);
+    }break;
+    case NODE_STATE_RX_END: {
+        /* check if ERROR or SUCCESS
+         * SUCCESS@Anchor:
+         *   check if Ping_t or ACK_t:
+         *        Ping_t => Send AnchorResponse_t
+         *        ACK_t => check if correct ACK_t:
+         *            correct => go to sleep
+         *            invalid => resend AnchorResponse_t
+         * ERROR@Anchor: (log error) + restart Rx()?
+         */
+        if (rx_result.state == RESULT_OK) {
+            if (rx_result.packet_type == PACKET_TYPE_PING) {
+                // synchronize interval_timer with ping reception -> TODO improve for multiple end nodes, so that multiple ping periods can be tracked
+                UTIL_TIMER_StartWithPeriod(&interval_timer, INTERVAL_PERIOD_MS-100);
+                UTIL_TIMER_StartWithPeriod(&listen_timer, LISTEN_PERIOD_MS);
+                send_anchor_response(rx_result.packet, rx_result.metadata.rssi);
+                anchor_response_retries = 0;
+            } else if (rx_result.packet_type == PACKET_TYPE_ACK) {
+                // go to sleep if max retry amount is reached
+                if (anchor_response_retries > MAX_ANCHOR_RESPONSE_RETRIES) {
+                    Radio.Standby();
+                    Radio.Sleep();
+                }
+
+                // check if ACK is for this device and its last transmitted AnchorResponse
+                if (((Ack_t*) rx_result.packet)->receiver_id == DEVICE_ID && ((Ack_t*) rx_result.packet)->packet_id == tx_anchor_response.packet_id) {
+                    Radio.Standby();
+                    Radio.Sleep();
+                } else {
+                    send_anchor_response(&rx_ping, rx_ping_rssi); // resend AnchorResponse_t for last received ping
+                    anchor_response_retries++;
+                }
+            }
+        } else {
+            APP_LOG(TS_ON, VLEVEL_M, "RX Error: %s\n\r", rx_result.msg);
+            if (UTIL_TIMER_IsRunning(&listen_timer)) {
+                Radio.Rx(ACK_TIMEOUT_MS);
+            } else {
+                Radio.Rx(ACQUIRE_PING_TIMEOUT_MS);
+            }
+        }
+    }break;
+    case NODE_STATE_TX_END: {
+        /* check if ERROR or SUCCESS
+         * SUCCESS@Anchor: start Rx(ACK_TIMEOUT)
+         * ERROR@Anchor: (log error) + go to sleep (wait for next Ping_t)
+         */
+        if (tx_result.state == RESULT_OK) {
+            Radio.Rx(ACK_TIMEOUT_MS);
+        } else {
+            APP_LOG(TS_ON, VLEVEL_M, "TX Error: %s\n\r", tx_result.msg);
+            Radio.Standby();
+            Radio.Sleep();
+        }
+    }break;
+    }
 }
 
-void encode_track_response(uint8_t *buffer, TrackResponse_t packet) {
-	if (buffer == NULL) {
-		return;
-	}
+#else
 
-	buffer[0] = (uint8_t) packet.device;
-	buffer[1] = packet.id;
-	buffer[2] = (uint8_t) (packet.recv_rssi >> 8) & 0xFF;
-	buffer[3] = (uint8_t) packet.recv_rssi & 0xFF;
+#error "Set atleast/only one of IS_ANCHOR_NODE and IS_END_NODE to 1."
+
+#endif
+
+/*
+ * Encoding/Decoding
+ */
+void encode_Ping(uint8_t *buffer, const Ping_t* packet) {
+    if (buffer == NULL) {
+        return;
+    }
+
+    buffer[0] = (uint8_t) packet->packet_type;
+    buffer[1] = (uint8_t) packet->device_id;
+    buffer[2] = packet->packet_id;
 }
 
-void decode_track_response(TrackResponse_t *packet, uint8_t *buffer) {
-	if (buffer == NULL || packet == NULL) {
-		packet = NULL;
-		return;
-	}
-	if (buffer[0] > BEACONC) {
-		packet = NULL;
-		return;
-	}
+void decode_Ping(Ping_t *packet, const uint8_t *buffer) {
+    if (buffer == NULL || packet == NULL) {
+        packet = NULL;
+        return;
+    }
+    if (buffer[1] > BEACONC) {
+        packet = NULL;
+        return;
+    }
 
-	packet->device = buffer[0];
-	packet->id = buffer[1];
-	packet->recv_rssi = buffer[2] << 8;
-	packet->recv_rssi |= buffer[3];
+    packet->packet_type = buffer[0];
+    packet->device_id = buffer[1];
+    packet->packet_id = buffer[2];
 }
+
+void encode_AnchorResponse(uint8_t *buffer, const AnchorResponse_t* packet) {
+    if (buffer == NULL) {
+        return;
+    }
+
+    buffer[0] = (uint8_t) packet->anchor_id;
+    buffer[1] = packet->packet_id;
+    buffer[2] = (uint8_t) (packet->recv_rssi >> 8) & 0xFF;
+    buffer[3] = (uint8_t) packet->recv_rssi & 0xFF;
+}
+
+void decode_AnchorResponse(AnchorResponse_t* packet, const uint8_t* buffer) {
+    if (buffer == NULL || packet == NULL) {
+        packet = NULL;
+        return;
+    }
+    if (buffer[0] > BEACONC) {
+        packet = NULL;
+        return;
+    }
+
+    packet->anchor_id = buffer[0];
+    packet->packet_id = buffer[1];
+    packet->recv_rssi = buffer[2] << 8;
+    packet->recv_rssi |= buffer[3];
+}
+
+void encode_Ack(uint8_t* buffer, const Ack_t* ack) {
+    if (buffer == NULL || ack == NULL) {
+        return;
+    }
+
+    buffer[0] = ack->packet_type;
+    buffer[1] = ack->receiver_id;
+    buffer[2] = ack->packet_id;
+}
+
+void decode_Ack(Ack_t* ack, const uint8_t* buffer) {
+    if (buffer == NULL || ack == NULL) {
+        return;
+    }
+
+    ack->packet_type = buffer[0];
+    ack->receiver_id = buffer[1];
+    ack->packet_id = buffer[2];
+}
+
+/*
+ * Sending packets
+ */
+static uint8_t ping_id_counter = 1;
+
+void send_ping() {
+    tx_ping.packet_type = PACKET_TYPE_PING;
+    tx_ping.device_id = DEVICE_ID;
+    tx_ping.packet_id = ping_id_counter;
+    ping_id_counter++;
+
+    tx_result.packet_type = tx_ping.packet_type;
+    tx_result.packet = &tx_ping;
+    encode_Ping(tx_buffer, tx_result.packet);
+    Radio.Send(tx_buffer, sizeof tx_ping);
+}
+
+void acknowledge_packet(const AnchorResponse_t* anchor_response) {
+    tx_ack.packet_type = PACKET_TYPE_ACK;
+    tx_ack.packet_id = anchor_response->packet_id;
+    tx_ack.receiver_id = anchor_response->anchor_id;
+
+    tx_result.packet_type = tx_ack.packet_type;
+    tx_result.packet = &tx_ack;
+    encode_Ack(tx_buffer, tx_result.packet);
+    Radio.Send(tx_buffer, sizeof tx_ack);
+}
+
+void send_anchor_response(const Ping_t* ping, int16_t rssi) {
+    tx_anchor_response.anchor_id = DEVICE_ID;
+    tx_anchor_response.packet_id = ping->packet_id;
+    tx_anchor_response.recv_rssi = rssi;
+
+    tx_result.packet_type = PACKET_TYPE_ANCHOR_RESPONSE;
+    tx_result.packet = &tx_anchor_response;
+    encode_AnchorResponse(tx_buffer, tx_result.packet);
+    Radio.Send(tx_buffer, sizeof tx_anchor_response);
+}
+
+/*
+ * Math for position estimation
+ */
 
 #define RSSI0 50
 #define PLE 32.0
 
 float calculate_distance(int16_t rssi) {
-	return pow(10, (rssi + RSSI0) / PLE);
+    return pow(10, (rssi + RSSI0) / PLE);
 }
 
-void estimate_position(TrackResponse_t a, TrackResponse_t b, TrackResponse_t c) {
-	float distance_a = calculate_distance(a.recv_rssi);
-	float distance_b = calculate_distance(b.recv_rssi);
-	float distance_c = calculate_distance(c.recv_rssi);
-	return;
+void estimate_position(const AnchorResponse_t* a, const AnchorResponse_t* b, const AnchorResponse_t* c) {
+    float distance_a = calculate_distance(a->recv_rssi);
+    float distance_b = calculate_distance(b->recv_rssi);
+    float distance_c = calculate_distance(c->recv_rssi);
+    return;
 }
 
-static uint8_t track_request_id = 1;
-
-void Tracking_Process(void)
-{
-
-#if IS_BEACON_DEVICE == 1
-		switch(node_state) {
-		case NODE_STATE_INIT: {
-			APP_LOG(TS_ON, VLEVEL_H, "INIT_PHASE\n\r");
-			// Beacon has nothing to do in INIT phase
-			SetState(NODE_STATE_TRACK_REQ_PHASE);
-			QueueTrackingTask();
-		}break;
-		case NODE_STATE_TRACK_REQ_PHASE: {
-			// Beacon is ready for receiving TrackRequests
-			APP_LOG(TS_ON, VLEVEL_H, "REQ_PHASE\n\r");
-			next_state = NODE_STATE_TRACK_RES_PHASE;
-			Radio.Rx(RX_TIMEOUT_VALUE);
-		}break;
-		case NODE_STATE_TRACK_RES_PHASE: {
-			APP_LOG(TS_ON, VLEVEL_H, "RES_PHASE\n\r");
-			// Beacon answers TrackRequest with a TrackResponse
-			TrackResponse_t packet;
-			switch (BEACON_ID) {
-			case 'A': {
-				packet.device = BEACONA;
-			} break;
-			case 'B': {
-				packet.device = BEACONB;
-			} break;
-			case 'C': {
-				packet.device = BEACONC;
-			} break;
-			}
-			packet.id = last_id;
-			packet.recv_rssi = last_rssi;
-
-			encode_track_response(BufferTx, packet);
-
-			next_state = NODE_STATE_WAIT;
-
-			Radio.Send(BufferTx, PAYLOAD_LEN);
-		}break;
-		case NODE_STATE_WAIT: {
-			APP_LOG(TS_ON, VLEVEL_H, "WAIT_PHASE\n\r");
-			SetState(NODE_STATE_INIT);
-			QueueTrackingTask();
-		}break;
-		}
-#elif IS_TAG_DEVICE == 1
-		switch(node_state) {
-		case NODE_STATE_INIT: {
-			// nothing to do -> switch to next state;
-			APP_LOG(TS_ON, VLEVEL_H, "INIT_PHASE\n\r");
-			SetState(NODE_STATE_TRACK_REQ_PHASE);
-			QueueTrackingTask();
-		}break;
-		case NODE_STATE_TRACK_REQ_PHASE: {
-			// Tag sends TrackRequest in REQ_PHASE
-			APP_LOG(TS_ON, VLEVEL_H, "REQ_PHASE\n\r");
-			TrackRequest_t track_request;
-			track_request.device = TAG;
-			track_request.id = track_request_id;
-			track_request_id++;
-
-			encode_track_request(BufferTx, track_request);
-
-			APP_LOG(TS_ON, VLEVEL_H, "Radio.Send()\n\r");
-
-			next_state = NODE_STATE_TRACK_RES_PHASE;
-
-			UTIL_TIMER_Start(&timerTimeout);
-			Radio.Send(BufferTx, PAYLOAD_LEN);
-		}break;
-		case NODE_STATE_TRACK_RES_PHASE: {
-			// Tag receives TrackResponses from all three beacons
-			//APP_LOG(TS_ON, VLEVEL_H, "RES_PHASE\n\r");
-			if (last_beacon_a_trk_res.id >= 1 && last_beacon_a_trk_res.id == last_beacon_b_trk_res.id && last_beacon_a_trk_res.id == last_beacon_c_trk_res.id) {
-				estimate_position(last_beacon_a_trk_res, last_beacon_b_trk_res, last_beacon_c_trk_res);
-				SetState(NODE_STATE_WAIT);
-
-			} else {
-				Radio.Rx(RX_TIMEOUT_VALUE);
-			}
-		}break;
-		case NODE_STATE_WAIT: {
-			APP_LOG(TS_ON, VLEVEL_H, "WAIT_PHASE\n\r");
-			SetState(NODE_STATE_INIT);
-			QueueTrackingTask();
-		}break;
-		}
-#endif
-}
-
-//static void OnledEvent(void *context)
-//{
-//  HAL_GPIO_TogglePin(LED2_GPIO_Port, LED2_Pin); /* LED_GREEN */
-//  HAL_GPIO_TogglePin(LED3_GPIO_Port, LED3_Pin); /* LED_RED */
-//  UTIL_TIMER_Start(&timerLed);
-//}
-
-static void OnTimeoutEvent(void *context)
-{
-	ErrorHandler("TX Timeout\n\r");
-	QueueTrackingTask();
-}
-
-static void ErrorHandler(char* errorMsg) {
-	APP_LOG(TS_ON, VLEVEL_H, "ERROR: %s", errorMsg);
-	SetState(NODE_STATE_INIT);
-}
-
-static void UpdateState() {
-	node_state = next_state;
-}
+/*
+ * State management, scheduling, debug/info helpers
+ */
 
 static void SetState(NodeState_t new_state) {
-	next_state = new_state;
-	UpdateState();
+    node_state = new_state;
 }
 
-static void QueueTrackingTask() {
-	UTIL_SEQ_SetTask((1 << CFG_SEQ_Task_SubGHz_Phy_App_Process), CFG_SEQ_Prio_0);
+static void QueueLoraLocatorTask() {
+    UTIL_SEQ_SetTask((1 << CFG_SEQ_Task_SubGHz_Phy_App_Process), CFG_SEQ_Prio_0);
 }
+
+static void print_metadata() {
+    APP_LOG(TS_OFF, VLEVEL_L, "\n\r====================\n\r");
+    APP_LOG(TS_OFF, VLEVEL_L, "LoRa Locator\n\r\n\r");
+    /* Get App version*/
+    APP_LOG(TS_OFF, VLEVEL_L, "APPLICATION_VERSION: V%X.%X.%X\r\n",
+            (uint8_t)(APP_VERSION_MAIN),
+            (uint8_t)(APP_VERSION_SUB1),
+            (uint8_t)(APP_VERSION_SUB2));
+
+    /* Get Middleware SubGhz_Phy info */
+    APP_LOG(TS_OFF, VLEVEL_L, "MW_RADIO_VERSION:    V%X.%X.%X\r\n",
+            (uint8_t)(SUBGHZ_PHY_VERSION_MAIN),
+            (uint8_t)(SUBGHZ_PHY_VERSION_SUB1),
+            (uint8_t)(SUBGHZ_PHY_VERSION_SUB2));
+
+    /* Modulation info */
+    APP_LOG(TS_OFF, VLEVEL_L, "---------------\n\r");
+    APP_LOG(TS_OFF, VLEVEL_L, "LORA_MODULATION\n\r");
+    APP_LOG(TS_OFF, VLEVEL_L, "LORA_BW: %d kHz\n\r", (1 << LORA_BANDWIDTH) * 125);
+    APP_LOG(TS_OFF, VLEVEL_L, "LORA_SF: %d\n\r", LORA_SPREADING_FACTOR);
+
+    /* Device configuration */
+    APP_LOG(TS_OFF, VLEVEL_L, "--------------------\n\r");
+    APP_LOG(TS_OFF, VLEVEL_L, "DEVICE_CONFIGURATION\n\r");
+    APP_LOG(TS_OFF, VLEVEL_L, "DEVICE_TYPE: %s\n\r", IS_ANCHOR_NODE ? "Anchor" : "EndNode");
+#if IS_ANCHOR_NODE == 1 && IS_END_NODE == 0
+    APP_LOG(TS_OFF, VLEVEL_L, "DEVICE_ID: %c\n\r", DEVICE_ID);
+#elif IS_ANCHOR_NODE == 0 && IS_END_NODE == 1
+    APP_LOG(TS_OFF, VLEVEL_L, "DEVICE_ID: %u\n\r", DEVICE_ID);
+#else
+#error "Set atleast/only one of IS_ANCHOR_NODE and IS_END_NODE to 1."
+#endif
+    APP_LOG(TS_OFF, VLEVEL_L, "====================\n\r");
+
+    APP_LOG(TS_OFF, VLEVEL_L, "rand: %d\n\r", random_delay);
+}
+
+char* pt_toString(PacketType_t packet_type) {
+    switch (packet_type) {
+    case PACKET_TYPE_PING: return "PING";
+    case PACKET_TYPE_ANCHOR_RESPONSE: return "ANCHOR_RESPONSE";
+    case PACKET_TYPE_ACK: return "ACK";
+    default: return "UNKNOWN";
+    }
+}
+
 
 /* USER CODE END PrFD */

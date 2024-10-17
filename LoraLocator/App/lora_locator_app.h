@@ -22,6 +22,8 @@
 #ifndef __SUBGHZ_PHY_APP_H__
 #define __SUBGHZ_PHY_APP_H__
 
+#include "lora_locator_conf.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -88,10 +90,10 @@ extern "C" {
 /**
   * @brief  Init Subghz Application
   */
-void SubghzApp_Init(void);
+void LoraLocator_Init(void);
 
 /* USER CODE BEGIN EFP */
-void Tracking_Process(void);
+void LoraLocator_Process(void);
 
 /* USER CODE END EFP */
 

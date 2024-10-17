@@ -69,7 +69,7 @@ void MX_SubGHz_Phy_Init(void)
   /* USER CODE BEGIN MX_SubGHz_Phy_Init_1_1 */
 
   /* USER CODE END MX_SubGHz_Phy_Init_1_1 */
-  SubghzApp_Init();
+  LoraLocator_Init();
   /* USER CODE BEGIN MX_SubGHz_Phy_Init_2 */
 
   /* USER CODE END MX_SubGHz_Phy_Init_2 */

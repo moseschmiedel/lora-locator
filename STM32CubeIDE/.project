@@ -299,6 +299,11 @@
 			<locationURI>PARENT-1-PROJECT_LOC/LoraLocator/App/lora_locator_app.c</locationURI>
 		</link>
 		<link>
+			<name>Application/User/LoraLocator/App/lora_locator_conf.c</name>
+			<type>1</type>
+			<location>/home/mose/projects/lora-locator/LoraLocator/App/lora_locator_conf.c</location>
+		</link>
+		<link>
 			<name>Application/User/LoraLocator/Target/radio_board_if.c</name>
 			<type>1</type>
 			<locationURI>PARENT-1-PROJECT_LOC/LoraLocator/Target/radio_board_if.c</locationURI>
